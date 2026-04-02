@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -53,10 +54,7 @@ impl AdapterError {
     }
 
     fn from_io(err: io::Error) -> Self {
-        if let Some(tls_error) = err
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<rustls::Error>())
-        {
+        if let Some(tls_error) = find_rustls_error_in_chain(&err) {
             return Self::from_tls(tls_error.clone());
         }
 
@@ -94,6 +92,23 @@ impl fmt::Display for AdapterError {
 }
 
 impl std::error::Error for AdapterError {}
+
+fn find_rustls_error_in_chain(err: &io::Error) -> Option<&rustls::Error> {
+    if let Some(current) = err.get_ref() {
+        if let Some(tls_error) = current.downcast_ref::<rustls::Error>() {
+            return Some(tls_error);
+        }
+    }
+
+    let mut source = err.source();
+    while let Some(current) = source {
+        if let Some(tls_error) = current.downcast_ref::<rustls::Error>() {
+            return Some(tls_error);
+        }
+        source = current.source();
+    }
+    None
+}
 
 /// Lightweight observability hooks for adapter boundaries.
 pub trait AdapterObserver {
@@ -173,11 +188,17 @@ impl WasiTlsClientConnector {
         server_name: ServerName<'static>,
         transport: T,
     ) -> Result<WasiTlsClientSession<T>, AdapterError> {
+        let server_name_for_error = server_name.clone();
         let mut conn = self
             .config
             .connect(server_name)
             .build()
-            .map_err(AdapterError::from_tls)?;
+            .map_err(|err| {
+                let mut mapped = AdapterError::from_tls(err);
+                mapped.message =
+                    format!("{} (server_name={server_name_for_error:?})", mapped.message);
+                mapped
+            })?;
 
         conn.set_buffer_limit(self.buffer_limit);
         conn.set_plaintext_buffer_limit(self.plaintext_buffer_limit);
@@ -279,6 +300,11 @@ impl<T: Read + Write, O: AdapterObserver> WasiTlsClientSession<T, O> {
     }
 
     /// Send cleartext application bytes into the TLS stream.
+    ///
+    /// If the plaintext write succeeds but a subsequent TLS pump fails,
+    /// this method returns `Ok(written)` for `written > 0` and leaves the
+    /// session in `Faulted` state; callers should check [`Self::state`]
+    /// before further use.
     pub fn send(&mut self, cleartext: &[u8]) -> Result<usize, AdapterError> {
         if matches!(
             self.state,
@@ -301,14 +327,20 @@ impl<T: Read + Write, O: AdapterObserver> WasiTlsClientSession<T, O> {
         self.sent_plaintext += written;
         self.observer.on_plaintext_send(written);
 
-        let _ = self.pump();
+        if let Err(error) = self.pump() {
+            // We intentionally preserve partial-send semantics: once plaintext is
+            // accepted by rustls, callers observe success for that consumed prefix.
+            if written == 0 {
+                return Err(error);
+            }
+        }
         Ok(written)
     }
 
     /// Receive decrypted cleartext bytes from the TLS stream.
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, AdapterError> {
         if self.conn.wants_read() {
-            let _ = self.pump();
+            self.pump()?;
         }
 
         let read = self
@@ -317,6 +349,14 @@ impl<T: Read + Write, O: AdapterObserver> WasiTlsClientSession<T, O> {
             .read(buf)
             .map_err(AdapterError::from_io)?;
         if read == 0 {
+            if self.conn.wants_read() {
+                return Err(AdapterError {
+                    kind: AdapterErrorKind::IoWouldBlock,
+                    outcome: AdapterOutcome::Retryable,
+                    message: "no plaintext available yet".to_string(),
+                });
+            }
+
             return Err(AdapterError {
                 kind: AdapterErrorKind::EndOfStream,
                 outcome: AdapterOutcome::EndOfStream,
@@ -333,6 +373,10 @@ impl<T: Read + Write, O: AdapterObserver> WasiTlsClientSession<T, O> {
     ///
     /// This operation is idempotent.
     pub fn close_cleartext(&mut self) -> Result<(), AdapterError> {
+        // Prevent pathological non-progress loops while still allowing many
+        // backpressured iterations to drain close_notify.
+        const MAX_CLOSE_PUMP_ITERS: usize = 1024;
+
         let (next_state, should_emit_close_notify) = self.state.begin_close();
         self.transition_state(next_state);
 
@@ -340,16 +384,24 @@ impl<T: Read + Write, O: AdapterObserver> WasiTlsClientSession<T, O> {
             self.conn.send_close_notify();
         }
 
-        while self.conn.wants_write() {
+        for _ in 0..MAX_CLOSE_PUMP_ITERS {
+            if !self.conn.wants_write() {
+                break;
+            }
             let report = self.pump()?;
             if report.tls_written == 0 {
                 break;
             }
         }
 
-        if !self.conn.wants_write() {
-            self.transition_state(ClientSessionState::Closed);
+        if self.conn.wants_write() {
+            return Err(AdapterError {
+                kind: AdapterErrorKind::Io,
+                outcome: AdapterOutcome::Fatal,
+                message: "close_notify drain did not complete within iteration limit".to_string(),
+            });
         }
+        self.transition_state(ClientSessionState::Closed);
 
         Ok(())
     }
