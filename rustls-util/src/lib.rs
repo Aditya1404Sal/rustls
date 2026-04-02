@@ -6,6 +6,12 @@ use rustls::Connection;
 
 mod stream;
 pub use crate::stream::{Stream, StreamOwned};
+mod wasi_tls;
+pub use crate::wasi_tls::{
+    AdapterError, AdapterErrorKind, AdapterObserver, AdapterOutcome, ClientSessionState,
+    NoopObserver, PumpReport, WASI_TLS_DRAFT_VERSION, WASI_TLS_PRIMARY_TARGET,
+    WASI_TLS_RUNTIME_MODEL, WasiTlsClientConnector, WasiTlsClientSession,
+};
 
 /// This function uses `io` to complete any outstanding IO for
 /// the connection.
