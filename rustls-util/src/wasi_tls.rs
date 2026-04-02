@@ -11,7 +11,7 @@ use crate::complete_io;
 pub(crate) mod wit {
     wit_bindgen::generate!({
         path: "wit",
-        world: "wasi-tls-client-adapter",
+        world: "imports",
     });
 }
 
