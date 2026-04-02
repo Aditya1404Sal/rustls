@@ -1,0 +1,43 @@
+package rustls:wasi-tls-client-adapter@0.1.0;
+
+interface types {
+  enum error-kind {
+    tls-protocol,
+    io-would-block,
+    io-interrupted,
+    unexpected-eof,
+    end-of-stream,
+    io,
+  }
+
+  enum outcome {
+    fatal,
+    retryable,
+    end-of-stream,
+  }
+
+  record error {
+    kind: error-kind,
+    outcome: outcome,
+    message: string,
+  }
+}
+
+interface client {
+  use types.{error};
+
+  resource connector;
+  resource session;
+
+  new-connector: func() -> connector;
+  connect: func(self: connector, server-name: string) -> result<session, error>;
+
+  send: func(self: session, cleartext: list<u8>) -> result<u64, error>;
+  recv: func(self: session, max-bytes: u64) -> result<list<u8>, error>;
+  pump: func(self: session) -> result<tuple<u64, u64>, error>;
+  close-cleartext: func(self: session) -> result<tuple<>, error>;
+}
+
+world wasi-tls-client-adapter {
+  export client;
+}

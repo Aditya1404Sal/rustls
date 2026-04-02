@@ -7,6 +7,14 @@ use rustls::{ClientConfig, ClientConnection, Connection, pki_types::ServerName};
 
 use crate::complete_io;
 
+#[cfg(feature = "wasi-tls-wit-bindgen")]
+pub(crate) mod wit {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "wasi-tls-client-adapter",
+    });
+}
+
 /// Supported wasi-tls draft version for this adapter.
 pub const WASI_TLS_DRAFT_VERSION: &str = "0.3.0-draft";
 
